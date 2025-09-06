@@ -394,7 +394,7 @@ def expand_tiers_glob(pattern: str, tiers_dir_hint: Optional[Path]) -> List[Path
 def main():
     parser = argparse.ArgumentParser(description="Step 9A: Pairwise separations (DD) for ASTRODEEP tiers.")
     here = Path(__file__).resolve()
-    project_root = here.parents[2]  # ...\JWST-Mature-Galaxies
+    project_root = here.parents[2]  # ...\JWST-HighZ-Mature-Galaxies
 
     tiers_dir_default = (project_root / "data_processed" / "tiers")
     default_glob = str((tiers_dir_default / "*.csv").resolve())
