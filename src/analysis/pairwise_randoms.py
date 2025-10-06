@@ -16,9 +16,9 @@ Outputs (per run tag):
   results/step9b/<timestamp>/step9b_run_summary.csv
 
 Run examples (from src/):
-  python analysis\\pairwise_randoms.py --tiers-glob "../data_processed/tiers/*.csv" --bin-min 1 --bin-max 250 --bin-width 5 --rand-mult 10
+  python analysis\\pairwise_randoms.py --tiers-glob "../data_pro...rs/*.csv" --bin-min 1 --bin-max 250 --bin-width 5 --rand-mult 10
   # With field stratification + smoothed N(z)
-  python analysis\\pairwise_randoms.py --tiers-glob "../data_processed/tiers/*.csv" --bin-min 1 --bin-max 250 --bin-width 5 --rand-mult 10 --stratify-by-field --z-kde
+  python analysis\\pairwise_randoms.py --tiers-glob "../data_pro...max 250 --bin-width 5 --rand-mult 10 --stratify-by-field --z-kde
 
 This script never edits inputs; it writes only to timestamped results/ and figures/ (and a randoms/ snapshot for inspection).
 """
@@ -33,15 +33,16 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, Tuple, List, Optional
 
+import glob
+import os
+
 import numpy as np
 import pandas as pd
-import matplotlib
-matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-# Fast path for pair enumeration
+# KDTree for fast pair counting (optional)
 try:
-    from scipy.spatial import cKDTree
+    from scipy.spatial import cKDTree as KDTree
     HAVE_SCIPY = True
 except Exception:
     HAVE_SCIPY = False
@@ -61,9 +62,6 @@ try:
 except Exception:
     ASTROPY_OK = False
 
-import glob
-import os
-
 # ---------- utilities ----------
 
 def timestamp_tag() -> str:
@@ -72,27 +70,33 @@ def timestamp_tag() -> str:
 def parse_tier_name(path: Path) -> str:
     stem = path.stem
     if "astrodeep_" in stem:
-        s = stem.split("astrodeep_", 1)[1]
-        if s.endswith("_coords"):
-            s = s[:-7]
-        if s:
-            return s
+        stem = stem.replace("astrodeep_", "")
     return stem
 
-def ensure_dirs(*paths: Path) -> None:
-    for p in paths:
-        p.mkdir(parents=True, exist_ok=True)
+def ensure_dirs(*dirs: Path) -> None:
+    for d in dirs:
+        d.mkdir(parents=True, exist_ok=True)
+
+def step_plot(edges: np.ndarray, counts: np.ndarray, title: str, outpath: Path) -> None:
+    centers = 0.5*(edges[:-1] + edges[1:])
+    plt.figure(figsize=(7,4))
+    plt.step(centers, counts, where="mid")
+    plt.xlabel("separation r (Mpc)")
+    plt.ylabel("pairs per bin")
+    plt.title(title)
+    plt.tight_layout()
+    plt.savefig(outpath, dpi=140)
+    plt.close()
+
+def hist_from_dists(d: np.ndarray, edges: np.ndarray) -> np.ndarray:
+    return np.histogram(d, bins=edges)[0].astype(np.int64)
 
 def make_bins(r_min: float, r_max: float, dr: float) -> np.ndarray:
-    if r_max <= r_min:
-        raise ValueError("bin-max must be greater than bin-min")
-    if dr <= 0:
-        raise ValueError("bin-width must be positive")
-    nbin = int(math.ceil((r_max - r_min) / dr))
-    return r_min + np.arange(nbin + 1) * dr
+    n = int(math.floor((r_max - r_min)/dr + 1e-9))
+    edges = np.linspace(r_min, r_min + n*dr, n+1, dtype=np.float64)
+    return edges
 
-def centers_from_edges(edges: np.ndarray) -> np.ndarray:
-    return 0.5 * (edges[:-1] + edges[1:])
+# ---------- column selection ----------
 
 def select_columns(df: pd.DataFrame) -> Tuple[str, str, str, str, Optional[str]]:
     """
@@ -110,7 +114,8 @@ def select_columns(df: pd.DataFrame) -> Tuple[str, str, str, str, Optional[str]]
     # RA/DEC/z candidates
     ra_c  = ["ra", "ra_optap", "ra_photoz"]
     dec_c = ["dec", "dec_optap", "dec_photoz"]
-    z_c   = ["zspec", "zphot", "z", "z_best"]
+    # Prefer z_best if present; then zspec, then zphot, then z
+    z_c   = ["z_best", "zspec", "zphot", "z"]
 
     ra = next((cols[k] for k in ra_c if k in cols), None)
     dec = next((cols[k] for k in dec_c if k in cols), None)
@@ -133,18 +138,40 @@ def load_data_points(csv_path: Path, max_rows: int = 0) -> Tuple[np.ndarray, Dic
         cols_needed.append(field_col)
     used_df = df.loc[:, list(dict.fromkeys(cols_needed))].copy()
 
+    # --- Coalesce redshift columns to mimic paper's z_best behavior ---
+    try:
+        cols_lower = {c.lower(): c for c in used_df.columns}
+        if ("zspec" in cols_lower) and ("zphot" in cols_lower):
+            zs = pd.to_numeric(used_df[cols_lower["zspec"]], errors="coerce")
+            zp = pd.to_numeric(used_df[cols_lower["zphot"]], errors="coerce")
+            z_work = zs.copy()
+            mask = (~np.isfinite(z_work)) | (z_work <= 0)
+            z_work[mask] = zp[mask]
+            used_df["z_work"] = z_work
+            if isinstance(c3, str) and c3.lower() == cols_lower["zspec"].lower():
+                c3 = "z_work"
+    except Exception:
+        pass
+
     if max_rows and max_rows > 0:
-        used_df = used_df.iloc[:max_rows].copy()
+        used_df = used_df.iloc[:max_rows, :].copy()
 
     if mode == "xyz":
         X = pd.to_numeric(used_df[c1], errors="coerce").to_numpy(np.float64)
         Y = pd.to_numeric(used_df[c2], errors="coerce").to_numpy(np.float64)
         Z = pd.to_numeric(used_df[c3], errors="coerce").to_numpy(np.float64)
-        pts = np.vstack([X, Y, Z]).T
-        mask = np.isfinite(pts).all(axis=1)
-        pts = pts[mask]
-        df_used = used_df.loc[mask].reset_index(drop=True)
+        finite = np.isfinite(X) & np.isfinite(Y) & np.isfinite(Z)
+        pts = np.vstack([X[finite], Y[finite], Z[finite]]).T
         meta = {"mode": "xyz", "cols": [c1, c2, c3], "field_col": field_col, "n_after": int(len(pts))}
+        if field_col:
+            df_used = pd.DataFrame({c1: used_df.loc[finite, c1].to_numpy(),
+                                    c2: used_df.loc[finite, c2].to_numpy(),
+                                    c3: used_df.loc[finite, c3].to_numpy(),
+                                    field_col: used_df.loc[finite, field_col].to_numpy()})
+        else:
+            df_used = pd.DataFrame({c1: used_df.loc[finite, c1].to_numpy(),
+                                    c2: used_df.loc[finite, c2].to_numpy(),
+                                    c3: used_df.loc[finite, c3].to_numpy()})
         return pts, meta, df_used
 
     if not ASTROPY_OK:
@@ -175,22 +202,24 @@ def load_data_points(csv_path: Path, max_rows: int = 0) -> Tuple[np.ndarray, Dic
     meta = {"mode": "radecz", "cols": [c1, c2, c3], "field_col": field_col, "n_after": int(len(pts))}
     return pts, meta, df_used.reset_index(drop=True)
 
+# ---------- N(z) helpers ----------
+
 def draw_z_samples_basic(z_vals: np.ndarray, size: int, rng: np.random.Generator, jitter_sigma: float = 0.0) -> np.ndarray:
     """Discrete resample with optional Gaussian jitter and clipping to data range."""
     idx = rng.integers(0, len(z_vals), size=size)
-    s = z_vals[idx].astype(np.float64, copy=True)
+    s = z_vals[idx].astype(np.float64)
     if jitter_sigma and jitter_sigma > 0:
-        s += rng.normal(0.0, jitter_sigma, size=size)
-        zmin, zmax = float(np.min(z_vals)), float(np.max(z_vals))
-        s = np.clip(s, zmin, zmax)
-    return s
-
-def draw_z_samples_kde(z_vals: np.ndarray, size: int, rng: np.random.Generator, bw_method: Optional[str|float] = "scott") -> np.ndarray:
-    """Sample from a KDE estimate of N(z). Requires SciPy."""
-    kde = gaussian_kde(z_vals.astype(np.float64), bw_method=bw_method)
-    s = kde.resample(size, seed=rng).reshape(-1).astype(np.float64)  # shape (n_samples,)
-    zmin, zmax = float(np.min(z_vals)), float(np.max(z_vals))
+        s = s + rng.normal(0.0, float(jitter_sigma), size=s.shape)
+    zmin, zmax = float(np.nanmin(z_vals)), float(np.nanmax(z_vals))
     return np.clip(s, zmin, zmax)
+
+def draw_z_samples_kde(z_vals: np.ndarray, size: int, rng: np.random.Generator, bw_method: str|float = "scott") -> np.ndarray:
+    kde = gaussian_kde(z_vals[~np.isnan(z_vals)], bw_method=bw_method)
+    s = kde.resample(size=size, seed=rng).reshape(-1)
+    zmin, zmax = float(np.nanmin(z_vals)), float(np.nanmax(z_vals))
+    return np.clip(s, zmin, zmax)
+
+# ---------- random catalog ----------
 
 def sample_random_catalog(df_used: pd.DataFrame,
                           meta: Dict,
@@ -199,7 +228,8 @@ def sample_random_catalog(df_used: pd.DataFrame,
                           stratify_by_field: bool = False,
                           z_kde: bool = False,
                           z_kde_bw: Optional[str|float] = "scott",
-                          z_jitter: float = 0.0) -> Tuple[pd.DataFrame, np.ndarray, Dict]:
+                          z_jitter: float = 0.0,
+                          random_ra_dec_indep: bool = False) -> Tuple[pd.DataFrame, np.ndarray, Dict]:
     """
     Build a selection-matched random catalog.
 
@@ -207,7 +237,7 @@ def sample_random_catalog(df_used: pd.DataFrame,
         - Resample existing XYZ rows with replacement; add tiny jitter to break ties.
 
     If meta['mode']=='radecz':
-        - (RA,Dec) are sampled JOINTLY by row (preserves sky footprint exactly).
+        - (RA,Dec) can be sampled JOINTLY by row (default; preserves sky footprint) or INDEPENDENTLY (paper replication).
         - z is sampled independently from N(z):
             * stratify_by_field=True: use N(z) within each field for the chosen RA/Dec row's field.
             * else: use the overall N(z).
@@ -222,19 +252,25 @@ def sample_random_catalog(df_used: pd.DataFrame,
         X = pd.to_numeric(df_used.iloc[idx, 0], errors="coerce").to_numpy(np.float64)
         Y = pd.to_numeric(df_used.iloc[idx, 1], errors="coerce").to_numpy(np.float64)
         Z = pd.to_numeric(df_used.iloc[idx, 2], errors="coerce").to_numpy(np.float64)
-        eps = rng.normal(0.0, 1e-6, size=(n_rand, 3))  # ~kpc jitter in Mpc units
-        pts = np.vstack([X, Y, Z]).T + eps
-        out_df = pd.DataFrame({"X": pts[:, 0], "Y": pts[:, 1], "Z": pts[:, 2]})
+        pts = np.vstack([X, Y, Z]).T
+        out_df = pd.DataFrame({"X": X, "Y": Y, "Z": Z})
         return out_df, pts, stats
 
     # radecz path
     ra_col, dec_col, z_col = meta["cols"]
     field_col = meta.get("field_col")
 
-    # We always sample (RA,Dec) jointly by row
-    idx_rd = rng.integers(0, len(df_used), size=n_rand)
-    ra_r = df_used[ra_col].to_numpy()[idx_rd]
-    dec_r = df_used[dec_col].to_numpy()[idx_rd]
+    # Sample RA/DEC for randoms
+    if random_ra_dec_indep:
+        ra_idx = rng.integers(0, len(df_used), size=n_rand)
+        dec_idx = rng.integers(0, len(df_used), size=n_rand)
+        ra_r = df_used[ra_col].to_numpy()[ra_idx]
+        dec_r = df_used[dec_col].to_numpy()[dec_idx]
+        idx_rd = ra_idx  # for field lookup we just reuse ra_idx; field is only used for stratifying z
+    else:
+        idx_rd = rng.integers(0, len(df_used), size=n_rand)
+        ra_r = df_used[ra_col].to_numpy()[idx_rd]
+        dec_r = df_used[dec_col].to_numpy()[idx_rd]
 
     # Decide how to draw z
     if stratify_by_field and field_col and (field_col in df_used.columns):
@@ -242,21 +278,41 @@ def sample_random_catalog(df_used: pd.DataFrame,
         # Pre-split z by field
         z_by_field: Dict[str, np.ndarray] = {}
         for key, grp in df_used.groupby(field_col):
-            z_by_field[str(key)] = grp[z_col].to_numpy().astype(np.float64)
+            z_by_field[str(key)] = pd.to_numeric(grp[z_col], errors="coerce").to_numpy(np.float64)
 
-        # For each sampled RA/Dec row, get its field and sample z from that field distribution
-        fields_for_rows = df_used[field_col].astype(str).to_numpy()[idx_rd]
-        z_r = np.empty(n_rand, dtype=np.float64)
-        for ufield in np.unique(fields_for_rows):
-            mask = (fields_for_rows == ufield)
-            z_vals = z_by_field[str(ufield)]
-            if z_kde and HAVE_SCIPY_STATS and len(z_vals) > 5:
-                stats["z_sampler"] = "kde"
-                stats["z_kde_bw"] = z_kde_bw
-                z_r[mask] = draw_z_samples_kde(z_vals, mask.sum(), rng, bw_method=z_kde_bw)
-            else:
-                stats["z_jitter"] = float(z_jitter)
-                z_r[mask] = draw_z_samples_basic(z_vals, mask.sum(), rng, jitter_sigma=z_jitter)
+        fields = df_used[field_col].astype(str).to_numpy()
+        f_r = fields[idx_rd] if len(fields) == len(df_used) else np.array(["None"]*len(idx_rd))
+        z_r = np.empty(len(idx_rd), dtype=np.float64)
+        mask = np.ones(len(idx_rd), dtype=bool)
+
+        if HAVE_SCIPY_STATS and z_kde:
+            stats["z_sampler"] = "kde"
+            stats["z_kde_bw"] = z_kde_bw
+            for uf in np.unique(f_r):
+                m = (f_r == uf) & mask
+                if not np.any(m):
+                    continue
+                z_vals = z_by_field.get(str(uf), None)
+                if z_vals is None or len(z_vals) < 5:
+                    mask_idx = np.where(m)[0]
+                    z_r[mask_idx] = draw_z_samples_basic(pd.to_numeric(df_used[z_col], errors="coerce").to_numpy(np.float64), len(mask_idx), rng, jitter_sigma=0.0)
+                else:
+                    z_r[m] = draw_z_samples_kde(z_vals, m.sum(), rng, bw_method=z_kde_bw)
+        else:
+            for uf in np.unique(f_r):
+                m = (f_r == uf) & mask
+                if not np.any(m):
+                    continue
+                z_vals = z_by_field.get(str(uf), None)
+                if z_vals is None or len(z_vals) == 0:
+                    z_vals = pd.to_numeric(df_used[z_col], errors="coerce").to_numpy(np.float64)
+                if z_kde and HAVE_SCIPY_STATS and len(z_vals) > 5:
+                    stats["z_sampler"] = "kde"
+                    stats["z_kde_bw"] = z_kde_bw
+                    z_r[m] = draw_z_samples_kde(z_vals, m.sum(), rng, bw_method=z_kde_bw)
+                else:
+                    stats["z_jitter"] = float(z_jitter)
+                    z_r[m] = draw_z_samples_basic(z_vals, m.sum(), rng, jitter_sigma=z_jitter)
     else:
         # Global N(z)
         z_vals = df_used[z_col].to_numpy().astype(np.float64)
@@ -285,61 +341,21 @@ def sample_random_catalog(df_used: pd.DataFrame,
 
     return out_df, pts, stats
 
-def hist_from_dists(dists: np.ndarray, edges: np.ndarray) -> np.ndarray:
-    h, _ = np.histogram(dists, bins=edges)
-    return h.astype(np.int64)
+# ---------- pair counting ----------
 
-def rr_hist(points: np.ndarray, edges: np.ndarray, r_max: float) -> Tuple[np.ndarray, int, str]:
+def count_pairs(points_a: np.ndarray, points_b: np.ndarray, edges: np.ndarray) -> Tuple[np.ndarray, int, str]:
+    """Return histogram counts for separations between points_a and points_b."""
+    # KDTree path first
     if HAVE_SCIPY:
-        tree = cKDTree(points)
-        N = len(points)
+        tree = KDTree(points_b, leafsize=32)
         counts = np.zeros(len(edges)-1, dtype=np.int64)
         n_pairs = 0
-        for i in range(N):
-            js = [j for j in tree.query_ball_point(points[i], r=r_max) if j > i]
+        r_max = float(edges[-1])
+        for i in range(len(points_a)):
+            js = tree.query_ball_point(points_a[i], r=r_max)
             if not js:
                 continue
-            diffs = points[js] - points[i]
-            d = np.sqrt(np.einsum("ij,ij->i", diffs, diffs))
-            keep = (d >= edges[0]) & (d < edges[-1])
-            d = d[keep]
-            if d.size:
-                counts += hist_from_dists(d, edges)
-                n_pairs += int(d.size)
-        return counts, n_pairs, "kdtree"
-
-    # Fallback (exact, slower)
-    pts = points
-    N = len(pts)
-    counts = np.zeros(len(edges)-1, dtype=np.int64)
-    n_pairs = 0
-    block = 2000
-    for i0 in range(0, N, block):
-        i1 = min(N, i0+block)
-        Pi = pts[i0:i1]
-        diffs = Pi[:,None,:] - pts[None,:,:]
-        d = np.sqrt(np.einsum("ijk,ijk->ij", diffs, diffs))
-        I, J = np.ogrid[i0:i1, 0:N]
-        mask_upper = (J > I)
-        d = d[mask_upper]
-        keep = (d >= edges[0]) & (d < edges[-1])
-        d = d[keep]
-        if d.size:
-            counts += hist_from_dists(d, edges)
-            n_pairs += int(d.size)
-    return counts, n_pairs, "bruteforce"
-
-def dr_hist(points_data: np.ndarray, points_rand: np.ndarray,
-            edges: np.ndarray, r_max: float) -> Tuple[np.ndarray, int, str]:
-    if HAVE_SCIPY:
-        tree = cKDTree(points_rand)
-        counts = np.zeros(len(edges)-1, dtype=np.int64)
-        n_pairs = 0
-        for i in range(len(points_data)):
-            js = tree.query_ball_point(points_data[i], r=r_max)
-            if not js:
-                continue
-            diffs = points_rand[js] - points_data[i]
+            diffs = points_b[js] - points_a[i]
             d = np.sqrt(np.einsum("ij,ij->i", diffs, diffs))
             keep = (d >= edges[0]) & (d < edges[-1])
             d = d[keep]
@@ -351,9 +367,9 @@ def dr_hist(points_data: np.ndarray, points_rand: np.ndarray,
     # Fallback
     counts = np.zeros(len(edges)-1, dtype=np.int64)
     n_pairs = 0
-    PR = points_rand
-    for i in range(len(points_data)):
-        diffs = PR - points_data[i]
+    PR = points_b
+    for i in range(len(points_a)):
+        diffs = PR - points_a[i]
         d = np.sqrt(np.einsum("ij,ij->i", diffs, diffs))
         keep = (d >= edges[0]) & (d < edges[-1])
         d = d[keep]
@@ -366,18 +382,6 @@ def expand_glob(pattern: str) -> List[Path]:
     norm = pattern.replace("\\", "/")
     return sorted(Path(m) for m in glob.glob(norm) if Path(m).is_file())
 
-def step_plot(edges: np.ndarray, counts: np.ndarray, title: str, out_png: Path):
-    centers = centers_from_edges(edges)
-    plt.figure(figsize=(7, 5))
-    plt.step(centers, counts, where="mid")
-    plt.xlabel("Separation d  [Mpc (comoving)]")
-    plt.ylabel("Pair counts")
-    plt.title(title)
-    plt.axvline(150.0, linestyle="--", linewidth=1)
-    plt.tight_layout()
-    plt.savefig(out_png, dpi=150)
-    plt.close()
-
 # ---------- main ----------
 
 def main():
@@ -387,8 +391,9 @@ def main():
     parser = argparse.ArgumentParser(description="Step 9B: random catalogs + RR/DR histograms (mask-matched).")
     tiers_default = str((project_root / "data_processed" / "tiers" / "*.csv").resolve())
     parser.add_argument("--tiers-glob", default=tiers_default, help="Glob for tier CSVs.")
+    parser.add_argument("--random-ra-dec-indep", action="store_true", help="Sample RA and DEC independently for randoms (paper replication).")
     parser.add_argument("--bin-min", type=float, default=1.0)
-    parser.add_argument("--bin-max", type=float, default=300.0)
+    parser.add_argument("--bin-max", type=float, default=250.0)
     parser.add_argument("--bin-width", type=float, default=5.0)
     parser.add_argument("--max-rows", type=int, default=0, help="Optional cap on data rows per tier (0=all).")
     parser.add_argument("--rand-mult", type=float, default=10.0, help="Randoms per data point (e.g., 10x).")
@@ -430,57 +435,42 @@ def main():
             continue
         print(f"  Data rows usable: {N_D} [{meta_data['mode']} cols={meta_data['cols']}, field={meta_data.get('field_col')}]")
 
-        N_R = int(math.ceil(args.rand_mult * N_D))
-        print(f"  Building random catalog: N_R = {N_R} (multiplier={args.rand_mult})")
+        # Randoms
+        N_R = int(math.ceil(float(args.rand_mult) * N_D))
+        print(f"  Generating randoms: N_R={N_R} (rand_mult={args.rand_mult})")
         R_df, R_xyz, rand_stats = sample_random_catalog(
             df_used, meta_data, N_R, rng,
             stratify_by_field=args.stratify_by_field,
             z_kde=args.z_kde,
             z_kde_bw=args.z_kde_bw,
-            z_jitter=args.z_jitter
+            z_jitter=args.z_jitter,
+            random_ra_dec_indep=args.random_ra_dec_indep
         )
 
         # Write random catalog for inspection
         out_rand = randoms_dir / f"random_{tier}.csv"
         R_df.to_csv(out_rand, index=False)
+        print(f"  Wrote randoms snapshot: {out_rand}")
 
-        # RR
-        print("  RR histogram ...")
-        RR_counts, RR_pairs, rr_method = rr_hist(R_xyz, edges, r_max)
-        # DR
-        print("  DR histogram ...")
-        DR_counts, DR_pairs, dr_method = dr_hist(D_xyz, R_xyz, edges, r_max)
+        # Pair counts
+        print("  Counting RR...")
+        RR_counts, pairs_RR_all, rr_method = count_pairs(R_xyz, R_xyz, edges)
+        print("  Counting DR...")
+        DR_counts, pairs_DR_all, dr_method = count_pairs(D_xyz, R_xyz, edges)
+        print("  Counting DD...")
+        DD_counts, pairs_DD_all, dd_method = count_pairs(D_xyz, D_xyz, edges)
 
-        # Normalization factors
-        pairs_DD_all = N_D * (N_D - 1) // 2
-        pairs_RR_all = N_R * (N_R - 1) // 2
-        pairs_DR_all = N_D * N_R
+        # Write histograms
+        base = results_dir
+        RR_path = base / f"RR_hist_{tier}.csv"
+        DR_path = base / f"DR_hist_{tier}.csv"
+        DD_path = base / f"DD_hist_{tier}.csv"
+        np.savetxt(RR_path, RR_counts, fmt="%d", delimiter=",")
+        np.savetxt(DR_path, DR_counts, fmt="%d", delimiter=",")
+        np.savetxt(DD_path, DD_counts, fmt="%d", delimiter=",")
+        print(f"  Wrote histograms: RR={RR_path.name}, DR={DR_path.name}, DD={DD_path.name}")
 
-        RR_norm = RR_counts / max(1, pairs_RR_all)
-        DR_norm = DR_counts / max(1, pairs_DR_all)
-
-        # Save CSVs
-        centers = centers_from_edges(edges)
-        rr_df = pd.DataFrame({
-            "bin_left_Mpc": edges[:-1],
-            "bin_right_Mpc": edges[1:],
-            "bin_center_Mpc": centers,
-            "RR_count": RR_counts,
-            "RR_norm": RR_norm
-        })
-        dr_df = pd.DataFrame({
-            "bin_left_Mpc": edges[:-1],
-            "bin_right_Mpc": edges[1:],
-            "bin_center_Mpc": centers,
-            "DR_count": DR_counts,
-            "DR_norm": DR_norm
-        })
-        out_rr = results_dir / f"RR_hist_{tier}.csv"
-        out_dr = results_dir / f"DR_hist_{tier}.csv"
-        rr_df.to_csv(out_rr, index=False)
-        dr_df.to_csv(out_dr, index=False)
-
-        # Meta JSONs (record random generation strategy)
+        # Meta JSONs
         base_meta = {
             "tier": tier,
             "input_csv": str(path.resolve()),
@@ -510,24 +500,17 @@ def main():
         step_plot(edges, DR_counts, f"DR separation histogram — {tier}", figures_dir / f"DR_hist_{tier}.png")
 
         elapsed = time.time() - t0
-        print(f"  Done {tier}: RR_pairs<=rmax={RR_pairs:,}, DR_pairs<=rmax={DR_pairs:,}  (elapsed {elapsed:.1f}s)")
+        print(f"  Done tier {tier} in {elapsed:.1f}s (methods: DD={dd_method}, DR={dr_method}, RR={rr_method}).")
 
         summary.append({
             "tier": tier,
             "n_data": N_D,
             "n_random": N_R,
-            "pairs_RR_all": pairs_RR_all,
-            "pairs_DR_all": pairs_DR_all,
-            "r_min_Mpc": edges[0],
-            "r_max_Mpc": edges[-1],
-            "bin_width_Mpc": edges[1] - edges[0],
-            "nbins": len(edges) - 1,
-            "RR_csv": out_rr.name,
-            "DR_csv": out_dr.name,
-            "RR_meta": f"RR_meta_{tier}.json",
-            "DR_meta": f"DR_meta_{tier}.json",
-            "RR_fig": f"RR_hist_{tier}.png",
-            "DR_fig": f"DR_hist_{tier}.png",
+            "nbins": int(len(edges)-1),
+            "r_min": float(edges[0]),
+            "r_max": float(edges[-1]),
+            "bin_width": float(edges[1]-edges[0]),
+            "method_DD": dd_method,
             "method_RR": rr_method,
             "method_DR": dr_method,
             "random_strategy": rand_stats

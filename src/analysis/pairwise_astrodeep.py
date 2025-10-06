@@ -141,14 +141,33 @@ def load_points(csv_path: Path, mode_hint: str = "auto",
     # Subset to columns for speed
     df = df.loc[:, list(set(used_cols))].copy()
 
+    # --- BEGIN: minimal best-z coalesce (paper behavior) ---
+    # Prefer z_best if present; else zspec filled with zphot when missing/invalid.
+    try:
+        cols_lower = {c.lower(): c for c in df.columns}
+        if "z_best" in cols_lower:
+            used_cols = (used_cols[0], used_cols[1], cols_lower["z_best"])
+        elif ("zspec" in cols_lower) and ("zphot" in cols_lower):
+            zs = pd.to_numeric(df[cols_lower["zspec"]], errors="coerce")
+            zp = pd.to_numeric(df[cols_lower["zphot"]], errors="coerce")
+            z_work = zs.copy()
+            fill_mask = (~np.isfinite(z_work)) | (z_work <= 0)
+            z_work[fill_mask] = zp[fill_mask]
+            df["z_work"] = z_work
+            used_cols = (used_cols[0], used_cols[1], "z_work")
+        # else: keep whatever select_columns chose (zphot or z)
+    except Exception:
+        pass
+    # --- END: minimal best-z coalesce ---
+
     # Truncate first if requested (keeps determinism pre-subsample)
     if max_rows and max_rows > 0:
         df = df.iloc[:max_rows].copy()
 
     if sel_mode == "xyz":
-        X = pd.to_numeric(df[c1], errors="coerce").to_numpy(np.float64, copy=False)
-        Y = pd.to_numeric(df[c2], errors="coerce").to_numpy(np.float64, copy=False)
-        Z = pd.to_numeric(df[c3], errors="coerce").to_numpy(np.float64, copy=False)
+        X = pd.to_numeric(df[used_cols[0]], errors="coerce").to_numpy(np.float64, copy=False)
+        Y = pd.to_numeric(df[used_cols[1]], errors="coerce").to_numpy(np.float64, copy=False)
+        Z = pd.to_numeric(df[used_cols[2]], errors="coerce").to_numpy(np.float64, copy=False)
         pts = np.vstack([X, Y, Z]).T
         mask = np.isfinite(pts).all(axis=1)
         pts = pts[mask]
@@ -157,9 +176,9 @@ def load_points(csv_path: Path, mode_hint: str = "auto",
         # radecz path
         if not ASTROPY_OK:
             raise RuntimeError("Astropy not available. Install with: pip install astropy")
-        ra_deg  = pd.to_numeric(df[c1], errors="coerce").to_numpy(np.float64, copy=False)
-        dec_deg = pd.to_numeric(df[c2], errors="coerce").to_numpy(np.float64, copy=False)
-        zz      = pd.to_numeric(df[c3], errors="coerce").to_numpy(np.float64, copy=False)
+        ra_deg  = pd.to_numeric(df[used_cols[0]], errors="coerce").to_numpy(np.float64, copy=False)
+        dec_deg = pd.to_numeric(df[used_cols[1]], errors="coerce").to_numpy(np.float64, copy=False)
+        zz      = pd.to_numeric(df[used_cols[2]], errors="coerce").to_numpy(np.float64, copy=False)
 
         # filter finite and z > 0
         mask = np.isfinite(ra_deg) & np.isfinite(dec_deg) & np.isfinite(zz) & (zz > 0)
@@ -167,9 +186,6 @@ def load_points(csv_path: Path, mode_hint: str = "auto",
         dec = np.deg2rad(dec_deg[mask])
         z = zz[mask]
 
-        # Prefer zspec if present and finite; otherwise zphot.
-        # If we only had one z column (from select_columns), we just use it.
-        # (This can be enhanced by reading both columns if available, but we keep it simple.)
         # Cosmology: comoving distance in Mpc
         r = Planck18.comoving_distance(z).to(u.Mpc).value
 
@@ -394,7 +410,7 @@ def expand_tiers_glob(pattern: str, tiers_dir_hint: Optional[Path]) -> List[Path
 def main():
     parser = argparse.ArgumentParser(description="Step 9A: Pairwise separations (DD) for ASTRODEEP tiers.")
     here = Path(__file__).resolve()
-    project_root = here.parents[2]  # ...\JWST-HighZ-Mature-Galaxies
+    project_root = here.parents[2]  # ...\JWST-Mature-Galaxies
 
     tiers_dir_default = (project_root / "data_processed" / "tiers")
     default_glob = str((tiers_dir_default / "*.csv").resolve())
@@ -403,7 +419,7 @@ def main():
                         default=default_glob,
                         help="Glob for tier CSVs (default: absolute path to ../data_processed/tiers/*.csv)")
     parser.add_argument("--bin-min", type=float, default=1.0, help="Lower edge of first distance bin [Mpc].")
-    parser.add_argument("--bin-max", type=float, default=300.0, help="Upper edge of last distance bin [Mpc].")
+    parser.add_argument("--bin-max", type=float, default=250.0, help="Upper edge of last distance bin [Mpc].")
     parser.add_argument("--bin-width", type=float, default=5.0, help="Bin width [Mpc].")
     parser.add_argument("--max-rows", type=int, default=0, help="Optional cap on rows per tier (0 = all).")
     parser.add_argument("--subsample", type=int, default=0, help="Optional subsample size before DD (0 = none).")
