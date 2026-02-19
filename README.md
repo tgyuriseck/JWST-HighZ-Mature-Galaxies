@@ -11,7 +11,7 @@
 ## Paper
 
 **JWST High-Redshift Galaxy Clustering: A Reproducible Photometric Pipeline and Inter-Field Variance Analysis at z > 8**  
-Timothy Gyuriseck (2025)
+Timothy Gyuriseck (2026)
 
 - **Status:** Submitted to *Monthly Notices of the Royal Astronomical Society* (MNRAS)
 - **Preprint:** *[Zenodo DOI will be added upon upload]*
@@ -174,12 +174,12 @@ JWST-HighZ-Mature-Galaxies/
 
 If you use this pipeline or findings in your research, please cite:
 ```bibtex
-@article{Gyuriseck2025,
+@article{Gyuriseck2026,
   author = {Gyuriseck, Timothy},
   title = {{JWST High-Redshift Galaxy Clustering: A Reproducible Photometric 
            Pipeline and Inter-Field Variance Analysis at z > 8}},
   journal = {MNRAS (submitted)},
-  year = {2025},
+  year = {2026},
   note = {GitHub: https://github.com/tgyuriseck/JWST-HighZ-Mature-Galaxies}
 }
 ```
